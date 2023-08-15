@@ -1,0 +1,15 @@
+{
+    "token": "bot token here",
+    "lavalink_ip": "localhost",
+    "lavalink_password": "youshallnotpass",
+    "lavalink_port": "2333",
+    "music_channel_id": 0,
+    "music_channel_msg_id": 0,
+    "background_image": "https://media.discordapp.net/attachments/863729925486673921/895186765319639041/maxresdefault_3.png",
+    "bot_colour": "0xDC143C",
+    "use_soundcloud": "False",
+    "use_spotify": "False",
+    "spotify_client_id": "0",
+    "spotify_client_secret": "0",
+    "setup": false
+}
