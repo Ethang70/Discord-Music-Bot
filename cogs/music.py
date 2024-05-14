@@ -5,13 +5,10 @@ import discord # Use discord components and embeds
 import math # Used for create queue pages
 import functions # Used for embed function
 import random # Used for shuffle selection song index
-import spotipy # Used to get meta data for spotify songs/playlists/albums
 import json # Used to load config
 
 from discord import app_commands # Used for slash commands
 from discord.ext import commands # To use command tree structure
-from spotipy.oauth2 import SpotifyClientCredentials # Used for logging into spotify
-from sclib.asyncio import SoundcloudAPI, Track, Playlist # Used for soundcloud
 
 # Load config 
 with open('config.json', 'r') as file:
@@ -19,7 +16,7 @@ with open('config.json', 'r') as file:
 
 channel_id = int(config["music_channel_id"])
 message_id = int(config["music_channel_msg_id"])
-loop = 0
+loop = wavelink.QueueMode.normal
 shuffle = 0
 paused = True
 
@@ -33,22 +30,20 @@ class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.setup = config["setup"]
-        self.spotify = config["use_spotify"]
-        self.soundcloud = config["use_soundcloud"]
 
         bot.loop.create_task(self.connect_nodes())
 
     #### CLASSES FOR BUTTONS ####
 
     class music_button_view(discord.ui.View):
-        def __init__(self, paused: bool = True, loop: int = 0, shuffle: int = 0, playing: bool = True):
+        def __init__(self, paused: bool = True, loop: wavelink.QueueMode = wavelink.QueueMode.normal, shuffle: int = 0, playing: bool = True):
             super().__init__(timeout = None)
             self.paused = paused
-            self.loop = loop
+            self.loops = loop
             self.shuffle = shuffle
             self.playing = playing
         
-            if self.playing:
+            if playing:
                 if self.paused:
                     self.add_item(Music.PauseButton("<:play:1084708670664880158>", discord.ButtonStyle.green))
                 else:
@@ -59,9 +54,9 @@ class Music(commands.Cog):
             self.add_item(Music.StopButton())
             self.add_item(Music.SkipButton())
             
-            if self.loop == 0:
+            if self.loops == wavelink.QueueMode.normal:
                 self.add_item(Music.LoopButton(discord.ButtonStyle.danger))
-            elif self.loop == 1:
+            elif self.loops == wavelink.QueueMode.loop_all:
                 self.add_item(Music.LoopButton(discord.ButtonStyle.green))
             else:
                 self.add_item(Music.LoopButton(discord.ButtonStyle.blurple))
@@ -83,10 +78,10 @@ class Music(commands.Cog):
                 await interaction.response.defer()
                 vc: wavelink.Player = ctx.voice_client
 
-                if vc.is_paused():
-                    await vc.resume()
+                if vc.paused:
+                    await vc.pause(False)
                 else:
-                    await vc.pause()
+                    await vc.pause(True)
                 
                 await Music.update_embed(Music, vc)
 
@@ -103,8 +98,7 @@ class Music(commands.Cog):
                 await interaction.response.defer()
                 vc: wavelink.Player = ctx.voice_client
                 vc.queue.clear()
-                await Music.reset_embed(self, vc)
-                await vc.disconnect()
+                await vc.skip(force = True)
 
 
     class SkipButton(discord.ui.Button['skip']):
@@ -119,8 +113,7 @@ class Music(commands.Cog):
             if check:
                 await interaction.response.defer()
                 vc: wavelink.Player = ctx.voice_client
-                end = vc.track.duration
-                await vc.seek(end*1000)
+                await vc.skip(force = True)
 
     
     class LoopButton(discord.ui.Button['loop']):
@@ -134,13 +127,14 @@ class Music(commands.Cog):
             if check:
                 await interaction.response.defer()
                 vc: wavelink.Player = ctx.voice_client
-                
-                global loop
+                LoopMode = vc.queue.mode
 
-                loop = loop + 1
-
-                if loop > 2:
-                    loop = 0
+                if LoopMode == wavelink.QueueMode.normal:
+                    vc.queue.mode = wavelink.QueueMode.loop_all
+                elif LoopMode == wavelink.QueueMode.loop_all:
+                    vc.queue.mode = wavelink.QueueMode.loop
+                else:
+                    vc.queue.mode = wavelink.QueueMode.normal
 
                 await Music.update_embed(self, vc)
 
@@ -171,15 +165,12 @@ class Music(commands.Cog):
     async def connect_nodes(self):
         """Connect to our Lavalink nodes."""
         await self.bot.wait_until_ready()
-
-        await wavelink.NodePool.create_node(bot=self.bot,
-                                            host=config["lavalink_ip"],
-                                            port=config["lavalink_port"],
-                                            password=config["lavalink_password"])
+        node: wavelink.Node = wavelink.Node(uri=config["lavalink_ip"], password=config["lavalink_password"])
+        await wavelink.Pool.connect(client=self.bot, nodes=[node])
             
     # Checks thats conditions are right for interactions
     async def check_cond(self, ctx, interaction, player, author = None):
-        if (not ctx.voice_client or not player.is_connected()) and interaction is not None:
+        if (not ctx.voice_client or not player.connected) and interaction is not None:
             embed = functions.discordEmbed("Failed Check", "Im not connected", botColourInt)
             await interaction.response.send_message(embed=embed, ephemeral = True, delete_after = (5))
             return False
@@ -237,10 +228,10 @@ class Music(commands.Cog):
         embed = discord.Embed(title = "No song currently playing ", color = int(config["bot_colour"], 16))
         embed.add_field(name="Queue: ", value="Empty")
         embed.set_image(url=config["background_image"])
-        embed.set_footer(text="Status: Idle")
+        embed.set_footer(text="Status: Idle", icon_url=player.node.client.user.avatar.url)
         Music.playing = False
         Music.paused = True
-        await message.edit(content="To add a song join voice, and type song or url here",embed=embed, view=Music.music_button_view())
+        await message.edit(content="To add a song join voice, and type song or url here",embed=embed, view=Music.music_button_view(True, playing = False))
 
     # Updates the music embed to reflect whats in the player
     async def update_embed(self, player):
@@ -253,15 +244,15 @@ class Music(commands.Cog):
 
         message = await channel.fetch_message(message_id)
         
-        if not player.is_connected or not player.is_playing:
+        if not player.connected or not player.playing:
             self.reset_embed(self,player)
             return
         else:
-            currentSong = player.track
-            identifier = currentSong.identifier
+            currentSong = player.current
             queue = player.queue
-            embed = discord.Embed(title = "Playing: " + currentSong.title + " [" + str(datetime.timedelta(seconds=currentSong.length)) + "]", url=currentSong.uri, color = int(config["bot_colour"], 16))
-            thumbnail = "https://i.ytimg.com/vi/" + identifier + "/hqdefault.jpg"
+            loop = player.queue.mode
+            embed = discord.Embed(title = "Playing: " + currentSong.title + " [" + str(datetime.timedelta(seconds=int(currentSong.length/1000))).split(".")[0] + "]", url=currentSong.uri, color = int(config["bot_colour"], 16))
+            thumbnail = currentSong.artwork
 
             if queue.is_empty:
                 qDesc ='Empty'
@@ -270,44 +261,46 @@ class Music(commands.Cog):
                 if queue.count > 8:
                     for i in range(0,7):
                         try: 
-                            song = queue._queue[i]
-                            qDesc += f'[{str(i + 1) + " - " + song.title + " [" + str(datetime.timedelta(seconds=song.length)) + "]"}]({song.uri})' + '\n'
+                            song = queue.peek(i)
+                            qDesc += f'[{str(i + 1) + " - " + song.title + " [" + str(datetime.timedelta(seconds=int(song.length/1000))).split(".")[0] + "]"}]({song.uri})' + '\n'
                         except:
-                            song = queue._queue[i]
+                            song = queue.peek(i)
                             qDesc += f'[{str(i + 1) + " - " + song.title}]' + '\n'
                     offset = queue.count - 7
                     qDesc += "and " + str(offset) + " more track(s)\n"
                 else:
                     for i in range(0,queue.count):
                         try:
-                            song = queue._queue[i]
-                            qDesc += f'[{str(i + 1) + " - " + song.title + " [" + str(datetime.timedelta(seconds=song.length)) + "]"}]({song.uri})' + '\n'
+                            song = queue.peek(i)
+                            qDesc += f'[{str(i + 1) + " - " + song.title + " [" + str(datetime.timedelta(seconds=int(song.length/1000))).split(".")[0] + "]"}]({song.uri})' + '\n'
                         except:
-                            song = queue._queue[i]
+                            song = queue.peek(i)
                             qDesc += f'[{str(i + 1) + " - " + song.title}]' + '\n'
             
-            if player.is_paused():
+            if player.paused:
                 status = "Paused"
                 paused = True
             else:
                 status = "Playing"
                 paused = False
 
-            if loop == 2:
-                status += " 🔂"
-            elif loop == 1:
-                status += " 🔁"
+            if loop == wavelink.QueueMode.loop:
+                status += "  🔂"
+            elif loop == wavelink.QueueMode.loop_all:
+                status += "  🔁"
 
             if shuffle == 1:
                 status += "  🔀"
             
             embed.set_image(url=thumbnail)
             embed.add_field(name="Queue: ", value=qDesc, inline=True)
-            embed.set_footer(text="Status: " + status)
+            
             try:
-                await message.edit(embed=embed, view=self.music_button_view(paused, loop, shuffle))
+                embed.set_footer(text=(player.guild.get_member(currentSong.extras.requester).nick + "    Status: " + status), icon_url=(player.guild.get_member(currentSong.extras.requester)).avatar.url)
             except:
-                await message.edit(embed=embed, view=Music.music_button_view(paused, loop, shuffle))
+                embed.set_footer(text=(player.guild.get_member(currentSong.extras.requester).name + "    Status: " + status), icon_url=(player.guild.get_member(currentSong.extras.requester)).avatar.url)
+
+            await message.edit(embed=embed, view=Music.music_button_view(paused, loop, shuffle))
 
     # Will play next track in queue or dc if no tracks left
     async def next(self, player):
@@ -321,90 +314,86 @@ class Music(commands.Cog):
     # A function to search for a track and to queue it onto the player
     # plus a boolean if the search should try YouTubeMusic first
     async def search_and_queue(self, player: wavelink.Player, ctx: commands.Context, 
-                               query: str, ytm: bool = False, sc: bool = False, pl: bool = False):
-        try:    
-            if ytm:
-                track = await wavelink.YouTubeMusicTrack.search(query = query, return_first=True)
-                tracks = [track]
-            elif pl:
-                video = None
-                if '&list' in query:
-                    query = query.split("&")
-                    video = query[0]
-                    query = query[1]
-                    query = "https://www.youtube.com/playlist?" + query
-
-                tracks = await wavelink.YouTubePlaylist.search(query=query)
-                tracks = tracks.tracks
-                    
-                if video is not None:
-                    video = await wavelink.YouTubeTrack.search(query=video, return_first=True)
-                    tracks_copy = tracks.copy()
-                    for track in tracks_copy:
-                        if track.thumb == video.thumb:
-                            break
-                        tracks.remove(track)
-            elif sc:
-                track = await wavelink.SoundCloudTrack.search(query=query, return_first=True)
-                tracks = [track]
+                               query: str, link: bool = False):
+        try:
+            if link:
+                tracks: wavelink.Search = await wavelink.Playable.search(query)
             else:
-                track = await wavelink.YouTubeTrack.search(query = query, return_first=True)
-                tracks = [track]
-        except:
-            if not ytm and not pl:
-                embed = functions.discordEmbed("Player", "Error: Could not find track, try giving me the URL", botColourInt)
+                tracks: wavelink.Search = await wavelink.Playable.search(query, source='ytsearch') 
+
+            if not tracks:
+                embed = functions.discordEmbed("Player", "Error: Could not find track :(", botColourInt)
                 msg = await ctx.send(embed=embed)
                 await asyncio.sleep(2)
                 await msg.delete()
-                if not player.is_playing():
-                    await self.next(player)
+        except:
+            embed = functions.discordEmbed("Player", "Error: Could not find track, try giving me the URL", botColourInt)
+            msg = await ctx.send(embed=embed)
+            await asyncio.sleep(2)
+            await msg.delete()
+            if not player.playing:
+                await self.next(player)
             return
 
-        for track in tracks:    
-            if player.is_playing():
+        for track in tracks:
+            track.extras = {"requester": ctx.author.id}    
+            if player.playing:
                 player.queue.put(track)
             else:
                 await player.play(track)
+            
+            if not link:
+                return
 
     #### LISTENERS ####
 
     # Triggers when a track starts playing
     @commands.Cog.listener()
-    async def on_wavelink_track_start(self, player: wavelink.Player, track: wavelink.Track):
+    async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload) -> None: 
+        player: wavelink.Player | None = payload.player
         await self.update_embed(player)
 
     # Triggers when a track ends 
     # Either by full run through or skip
     @commands.Cog.listener()
-    async def on_wavelink_track_end(self, player: wavelink.Player, track: wavelink.Track, reason):        
+    async def on_wavelink_track_end(self, payload: wavelink.TrackEndEventPayload) -> None:
+        player: wavelink.Player | None = payload.player
+
+        if player is None:
+            return
         if shuffle == 1:
             if not player.queue.is_empty:
                 index = random.randint(0,player.queue.count-1)
-                strack = player.queue._queue[index]
+                strack = player.queue[index]
         
-        if loop == 0:
+        if player.queue.mode == wavelink.QueueMode.normal:
             if shuffle == 1 and not player.queue.is_empty:
                 await player.play(strack)
-                del player.queue._queue[index]
+                del player.queue[index]
             else:
                 await self.next(player)
-        elif loop == 2:
-            await player.play(track)
-        else:
-            player.queue.put(track)
+        elif player.queue.mode == wavelink.QueueMode.loop:
+            await player.play(payload.track)
+        elif player.queue.mode == wavelink.QueueMode.loop_all:
             if shuffle == 1 and not player.queue.is_empty:
                 await player.play(strack)
-                del player.queue._queue[index]
+                del player.queue[index]
+                player.queue.put(payload.track)
+            elif player.queue.is_empty:
+                await player.play(payload.track)
             else:
+                player.queue.put(payload.track)
                 await self.next(player)
 
-        if player.is_playing():
+                
+
+        if player.playing:
             await self.update_embed(player)
 
     # Triggers when a connection to a node has been established
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, node: wavelink.Node):
-        print(f'Node: <{node.identifier}> is ready!')
+        print(f'Node: <{node.node.identifier}> is ready!')
 
     # Triggers when any message is sent
     @commands.Cog.listener()
@@ -415,7 +404,7 @@ class Music(commands.Cog):
         if message.author == bot.user:
             return
 
-        if self.setup is True and message.channel.id == channel_id:
+        if config["setup"] is True and message.channel.id == channel_id:
             ctx = await bot.get_context(message)
             asyncio.get_event_loop().create_task(self.del_msg(message))
             ctx.command = bot.get_command('play')
@@ -437,98 +426,16 @@ class Music(commands.Cog):
         else:
             vc: wavelink.Player = ctx.voice_client
 
-        # Dealing with spotify link
-        if "open.spotify.com/" in query and self.spotify.lower() == "true":
-            # Log into Spotify
-            client_credentials_manager = SpotifyClientCredentials(client_id=config["spotify_client_id"], client_secret=config["spotify_client_secret"])
-            sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
+        vc.autoplay = wavelink.AutoPlayMode.disabled
 
-            # Grab URI
-            URI = query.split("/")[-1].split("?")[0]
-
-            # Dealing with playlist
-            if "playlist" in query:
-                results = sp.playlist_tracks(URI)
-                tracks = results['items']
-
-                # Grab all entries in playlist
-                while results['next']:
-                    results = sp.next(results)
-                    tracks.extend(results['items'])
-
-                embed = functions.discordEmbed("Spotify Playlist", "Adding songs to queue, please wait", botColourInt)
-                embed.set_thumbnail(url="https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExZTkwMzc4NTViYzliOTdiMmY2NTcyMmE0OTE0N2ZmNTIyOTFiNmIwMCZjdD1z/cOfwtFobGCLJBU3DNn/giphy.gif")
-                msg = await ctx.send(embed=embed)
-
-                for track in tracks:
-                    track_name = track["track"]["name"]
-                    artist_name = track["track"]["artists"][0]["name"]
-                    album = track["track"]["album"]["name"]
-
-                    ytm_query = str(str(track_name) + " " + str(artist_name) + " " + str(album))
-                    await self.search_and_queue(player=vc, ctx=ctx, query=ytm_query, ytm=True)
-
-                await msg.delete()
-            else:
-                # Dealing with an Album
-                album = ""
-                if "album" in query:
-                    results = sp.album_tracks(URI)
-                    tracks = results['items']
-                    
-                    while results['next']:
-                        results = sp.next(results)
-                        tracks.extend(results['items'])
-                        album = sp.album(URI)['name']
-                # Dealing with an individual track
-                else:
-                    track = sp.track(URI)
-                    tracks = [track]
-
-                if len(tracks) > 1:
-                    embed = functions.discordEmbed("Spotify Playlist", "Adding songs to queue, please wait", botColourInt)
-                    embed.set_thumbnail(url="https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExZTkwMzc4NTViYzliOTdiMmY2NTcyMmE0OTE0N2ZmNTIyOTFiNmIwMCZjdD1z/cOfwtFobGCLJBU3DNn/giphy.gif")
-                    msg = await ctx.send(embed=embed)
-
-                for track in tracks:
-                    track_name = track["name"]
-                    artist_name = track["artists"][0]["name"]
-                    ytm_query = str(str(track_name) + " " + str(artist_name) + " " + str(album))
-                    await self.search_and_queue(player=vc, ctx=ctx, query=ytm_query, ytm=True, pl=True)
-
-                if len(tracks) > 1:
-                    await msg.delete()
-        # Deal1ing with soundcloud links            
-        elif "soundcloud.com" in query and self.soundcloud.lower() == "true":
-            api = SoundcloudAPI()
-            if '/sets/' in query:
-                playlist = await api.resolve(query)
-                try:
-                    assert type(playlist) is Playlist
-
-                    for track in playlist.tracks:
-                        await self.search_and_queue(player=vc, ctx=ctx, query=track.title, sc=True)
-                except:
-                    assert type(playlist) is Track
-
-                    await self.search_and_queue(player=vc, ctx=ctx, query=playlist.title, sc=True)
-            else:
-                track = await api.resolve(query)
-                assert type(track) is Track
-
-                await self.search_and_queue(player=vc, ctx=ctx, query=track.title, sc=True)
-        # Dealing with normal YouTube tracks
+        # Dealing with a link
+        if "https://" in query and ".com" in query:
+            await self.search_and_queue(player=vc, ctx=ctx, query=query, link=True)
+        # Otherwise default to YouTube Query         
         else:
-            if query.startswith("https://www.youtube.com/playlist?") or '&list' in query:
-                await self.search_and_queue(player=vc, ctx=ctx, query=query, pl=True)
-            else:
-                if '&t' in query:
-                    query = query.split("&")
-                    query = query[0]
+            await self.search_and_queue(player=vc, ctx=ctx, query=query)
 
-                await self.search_and_queue(player=vc, ctx=ctx, query=query)
-        
-        if vc.is_playing():
+        if vc.playing:
             await self.update_embed(vc)
 
     # Moves a song position in the queue to one specified
@@ -548,24 +455,26 @@ class Music(commands.Cog):
 
             if current > len(vc.queue)-1 or current < 0:
                 await interaction.response.send_message(content = 'Current index out of bounds', ephemeral = True, delete_after = (2))
+                return  
         
             if new > len(vc.queue)-1 or new < 0:
                 await interaction.response.send_message(content = 'New index out of bounds', ephemeral = True, delete_after = (2))
+                return
 
-            song = vc.queue._queue[current]
+            song = vc.queue[current]
             
-            del vc.queue._queue[current]
+            del vc.queue[current]
             queue = vc.queue
 
             for i in range(len(queue)-1, new):
                 if i == len(queue) -1:
-                    queue.put(queue._queue[i])
+                    continue
                 else:
-                    queue._queue[i+1] = queue._queue[i]
+                    queue[i+1] = queue[i]
         else:
             return
 
-        vc.queue.put_at_index(new, song)
+        vc.queue.put_at(new, song)
         await self.update_embed(vc)
         embed = functions.discordEmbed('Move', 'Moved ' + song.title + ' from ' + str(current+1) + ' to ' + str(new+1), botColourInt)
         await interaction.response.send_message(embed=embed, delete_after = (4))
@@ -581,8 +490,8 @@ class Music(commands.Cog):
             vc: wavelink.Player = ctx.voice_client
             if vc.queue.is_empty:
                 return
-            song = vc.queue._queue[song_number-1]
-            del vc.queue._queue[song_number-1]
+            song = vc.queue[song_number-1]
+            del vc.queue[song_number-1]
 
             embed = functions.discordEmbed('Remove', "Song removed: " + song.title, botColourInt)
             await interaction.response.send_message(embed=embed, delete_after = (1))
@@ -639,7 +548,7 @@ class Music(commands.Cog):
 
 
         for i in range(start,end):
-            song = queue._queue[i]
+            song = queue[i]
             qDesc += f'[{str(i + 1) + " - " + song.title}]({song.uri})' + '\n'
             
         
@@ -655,12 +564,12 @@ class Music(commands.Cog):
 
         if check:
             vc: wavelink.Player = ctx.voice_client
-            current_song  = vc.track
-            pos = str(datetime.timedelta(seconds=int(vc.position))) 
-            dur = str(datetime.timedelta(seconds=current_song.length)) 
+            current_song  = vc.current
+            pos = str(datetime.timedelta(seconds=int(vc.position/1000))) 
+            dur = str(datetime.timedelta(seconds=current_song.length/1000)) 
 
-            song = f'**[{current_song.title}]({current_song.uri})**\n({pos}/{dur})'
-            embed = discord.Embed(color= int(config["bot_colour"], 16), title='Now Playing', description=song)
+            song = f'**[{current_song.title}]({current_song.uri})**\n({pos.split(".")[0]}/{dur.split(".")[0]})'
+            embed = discord.Embed(color= int(config['bot_colour'], 16), title='Now Playing', description=song)
             await interaction.response.send_message(embed=embed, ephemeral = True, delete_after = (5))
 
     # Seeks out and jumps to a point in a song based on time given
@@ -684,7 +593,7 @@ class Music(commands.Cog):
 
     # Adds a volume filter to the player, up to volume increase of 500%
     @app_commands.command(name = "volume", description = "Change volume of the player")
-    @app_commands.describe(vol = "Volume in percent (Goes up to 1000%) (No need for %)")
+    @app_commands.describe(vol = "Volume in percent (Goes up to 100%) (No need for %)")
     async def volume(self, interaction: discord.Interaction, vol: int):
         ctx = await interaction.client.get_context(interaction)
         check = await Music.check_cond(self, ctx, interaction, ctx.voice_client)
@@ -692,7 +601,7 @@ class Music(commands.Cog):
         if check:
             vc: wavelink.Player = ctx.voice_client
 
-            if vol > 1000 or vol < 0:
+            if vol > 100 or vol < 0:
                 embed = functions.discordEmbed('Volume' , 'Invalid volume size, please try between 0-1000', botColourInt)
             else:
                 await vc.set_volume(vol)
@@ -779,54 +688,6 @@ class Music(commands.Cog):
             embed = functions.discordEmbed('Terminate' , 'There is no channel setup, please use /setup', botColourInt)
             await interaction.response.send_message(embed=embed, ephemeral = True)
 
-    # Changes the equaliser settings
-    @app_commands.command(name = 'eq', description = 'Change the settings of the equaliser.')
-    @app_commands.describe(profile = 'Choose a preset EQ Profile.')
-    async def eq(self, interaction: discord.Interaction, profile: str):
-        ctx = await interaction.client.get_context(interaction)
-        check = await Music.check_cond(self, ctx, interaction, ctx.voice_client)
-        EQ_FLAT = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0)]
-        EQ_BASS_BOOSTED = [(0, 0.8), (1, 0.4275), (2, 0.365), (3, 0.3025), (4, 0.24), (5, 0.1775), (6, 0.115), (7, 0.0525), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0)]
-        EQ_MAX_BASS_BOOSTED = [(0, 1.0), (1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 1.0), (6, 1.0), (7, 1.0), (8, 0), (9, 0), (10, 0), (11, 0), (12, 0), (13, 0), (14, 0)]
-        EQ_ROCK = [(0, 0.45), (1, 0.425), (2, 0.375), (3, 0.325), (4, 0.275), (5, 0.225), (6, 0.175), (7, -0.05), (8, 0.05), (9, 0.1), (10, 0.15), (11, 0.2), (12, 0.25), (13, 0.3), (14, 0.35)]
-        EQ_POP = [(0, -0.05), (1, -0.03), (2, -0.025), (3, 0), (4, 0.15), (5, 0.2), (6, 0.32), (7, 0.31), (8, 0.29), (9, 0.23), (10, 0.15), (11, 0.01), (12, -0.025), (13, -0.03), (14, -0.05)]
-        EQ_IN_THE_CLUB_TOILETS = [(0, 0.3), (1, 0.25), (2, 0.15), (3, 0.1), (4, -0.25), (5, -0.25), (6, -0.25), (7, -0.25), (8, -0.25), (9, -0.25), (10, -0.25), (11, -0.25), (12, -0.25), (13, -0.25), (14, -0.25)]
-        EQ_CLASSICAL = [(0, 0.1), (1, 0.1), (2, 0.05), (3, 0), (4, 0.05), (5, 0.12), (6, 0.14), (7, 0.15), (8, 0.05), (9, 0.14), (10, 0.19), (11, 0.23), (12, 0.15), (13, 0.165), (14, 0.19)]
-        EQ_EDM = [(0, 0.45), (1, 0.4), (2, 0.37), (3, 0.15), (4, 0.12), (5, 0), (6, -0.13), (7, -0.06), (8, 0.12), (9, 0.06), (10, 0.02), (11, 0.07), (12, 0.2), (13, 0.35), (14, 0.45)]
-
-        if check:
-            if profile.lower() == 'bass boosted':
-                eq = wavelink.Equalizer(bands=EQ_BASS_BOOSTED)
-                embed = functions.discordEmbed('EQ', 'EQ was set to Bass Boosted.', botColourInt)
-            elif profile.lower() == 'max bass boosted':
-                eq = wavelink.Equalizer(bands=EQ_MAX_BASS_BOOSTED)
-                embed = functions.discordEmbed('EQ', 'EQ was set to Max Bass Boosted.', botColourInt)
-            elif profile.lower() == 'rock':
-                eq = wavelink.Equalizer(bands=EQ_ROCK)
-                embed = functions.discordEmbed('EQ', 'EQ was set to Rock.', botColourInt)
-            elif profile.lower() == 'pop':
-                eq = wavelink.Equalizer(bands=EQ_POP)
-                embed = functions.discordEmbed('EQ', 'EQ was set to Pop.', botColourInt)
-            elif profile.lower() == 'in the club toilets':
-                eq = wavelink.Equalizer(bands=EQ_IN_THE_CLUB_TOILETS)
-                embed = functions.discordEmbed('EQ', 'EQ was set to In The Club Toilets.', botColourInt)
-            elif profile.lower() == 'classical':
-                eq = wavelink.Equalizer(bands=EQ_POP)
-                embed = functions.discordEmbed('EQ', 'EQ was set to Classical.', botColourInt)
-            elif profile.lower() == 'edm':
-                eq = wavelink.Equalizer(bands=EQ_EDM)
-                embed = functions.discordEmbed('EQ', 'EQ was set to EDM.', botColourInt)
-            else:
-                # Default Flat EQ
-                eq = wavelink.Equalizer(bands=EQ_FLAT)
-                embed = functions.discordEmbed('EQ', 'EQ was set to flat.', botColourInt)
-
-            # Create filter and set the filter to the player
-            eqFilter = wavelink.Filter(equalizer=eq)
-            vc: wavelink.Player = ctx.voice_client
-            await vc.set_filter(eqFilter)
-
-            await interaction.response.send_message(embed=embed, delete_after = (1))
 
 
 async def setup(bot):

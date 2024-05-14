@@ -17,7 +17,7 @@ class bcolors:
 with open('config.json', 'r') as file:
     config = json.load(file)
 
-version = "0.1"
+version = "1"
 token = config["token"]
 botColour = config["bot_colour"]
 botColourInt = int(botColour, 16)
@@ -44,7 +44,7 @@ async def on_ready():
 
     print(bcolors.OKGREEN + "Extensions Loaded" + bcolors.ENDC)
 
-    # await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='you '+ config('PREFIX') +'rtd | v' + version))
+    await client.change_presence(activity=discord.Activity(type=discord.ActivityType.streaming, name='music'))
     await tree.sync()
 
 client.run(token)
